@@ -152,24 +152,26 @@ if ( contig_dir ) {
 
 if ( taxid ) {
     process GETCOMPLETESEQS_NCBIGENOMEDOWNLOAD {
-        tag "${taxonid}"
+        tag "TaxID ${taxonid}"
 
-        publishDir "${outputDir}/downloaded_genomes", mode: 'copy', pattern: "*.fna"
+        publishDir "${outputDir}/downloaded_genomes/COMPLETE", mode: 'copy', pattern: "*.fna"
+        publishDir "${outputDir}/downloaded_genomes", mode: 'copy', pattern: "TaxID_${taxonid}.complete_download.tab"
 
-        cpus 2
+        cpus 12
 
         input:
         val taxonid from ch_taxid_getCompleteSeqs
 
         output:
         tuple file("*.fna"), val("COMPLETE") into ch_getCompleteSeqs
+        file("TaxID_${taxonid}.complete_download.tab")
 
         script:
         """
         ncbi-genome-download -F fasta \
         -l complete,chromosome \
         -p ${task.cpus} \
-        -m TaxID_${taxonid}.genome_download.tab \
+        -m TaxID_${taxonid}.complete_download.tab \
         -s ${ncbi_section}\
         -t ${taxonid} \
         bacteria
@@ -182,24 +184,26 @@ if ( taxid ) {
     }
 
     process GETCONTIGSEQS_NCBIGENOMEDOWNLOAD {
-        tag "${taxonid}"
+        tag "TaxID ${taxonid}"
 
-        publishDir "${outputDir}/downloaded_genomes", mode: 'copy', pattern: "*.fna"
+        publishDir "${outputDir}/downloaded_genomes/CONTIG", mode: 'copy', pattern: "*.fna"
+        publishDir "${outputDir}/downloaded_genomes", mode: 'copy', pattern: "TaxID_${taxonid}.contig_download.tab"
 
-        cpus 2
+        cpus 12
 
         input:
         val taxonid from ch_taxid_getContigSeqs
 
         output:
         tuple file("*.fna"), val("CONTIG") into ch_getContigSeqs
+        file("TaxID_${taxonid}.contig_download.tab")
 
         script:
         """
         ncbi-genome-download -F fasta \
         -l scaffold,contig \
         -p ${task.cpus} \
-        -m TaxID_${taxonid}.genome_download.tab \
+        -m TaxID_${taxonid}.contig_download.tab \
         -s ${ncbi_section}\
         -t ${taxonid} \
         bacteria
@@ -349,7 +353,7 @@ ch_callSequenceType1.map{ tuple( it[0], it[1].trim().split("\t") )}
                    .map{ tuple(it[1][2], tuple( it[1][0] , it[0] ) ) }
                    .filter{ !( it[0] =~ /-/ ) }
                    .groupTuple()
-                   .map{ [ it[0], it[1].take( maxstsize.toInteger() ) ] }
+                   //.map{ [ it[0], it[1].take( maxstsize.toInteger() ) ] }
                    .filter{ it[1].size() >= minstsize }
                    .filter{ it[1][0][1] ==~ /COMPLETE/ }
                    .transpose()
@@ -357,7 +361,9 @@ ch_callSequenceType1.map{ tuple( it[0], it[1].trim().split("\t") )}
                    .join( ch_removeExtrachromosomalSeqs_clusterGenomes.concat(ch_callSequenceType2)
                         .map{ tuple( it.getName(), it ) }, by: 0 )
                    .map{ tuple( it[1], it[2], it[0], it[3] ) }
-                   .into { ch_callSequenceType_clusterGenomes ; 
+                   //.println()
+                   .into { ch_callSequenceType_clusterGenomes ;
+                           ch_callSequenceType_clusterAllGenomes ; 
                            ch_callSequenceType_mapGenomes ;
                            ch_callSequenceType_copyGenomes }
                     //[ ST, assembly_status, seq_name, seq_path ]
@@ -381,11 +387,8 @@ process COPYGENOMES_LOCAL {
 }
 
 
-
-process CLUSTERGENOMES_MASH {
+process CLUSTERCOMPLETEGENOMES_MASH {
     tag "ST${ST}"
-
-    publishDir "${outputDir}/ST${ST}", mode: 'copy', pattern: "ST${ST}.mash_dist.tab"
 
     input:
     tuple ST, file("fasta/*") from ch_callSequenceType_clusterGenomes.filter{ it[1] ==~ /COMPLETE/ }.groupTuple().map{ tuple( it[0], it[3] ) }
@@ -409,6 +412,7 @@ process IDENTIFYSTREFSEQUENCE_PYTHON {
     
     output:
     tuple ST, stdout into ch_identifyRefSequence_mapGenomes
+    tuple ST, stdout into ch_identifyRefSequence_clusterAllGenomes
 
     script:
     """
@@ -439,6 +443,72 @@ process IDENTIFYSTREFSEQUENCE_PYTHON {
     print(lowest_dist_med, end = '')
     """
 }
+
+
+
+process CLUSTERALLGENOMES_MASH {
+    tag "ST${ST}"
+
+    cpus { 1 + fasta_count / 20 <= 8 ? 1 + fasta_count / 20 : 4 }
+
+    publishDir "${outputDir}/ST${ST}", mode: 'copy', pattern: "ST${ST}.mash_dist_from_ref.tab"
+
+    input:
+    tuple ST, refname, file("fasta/*"), fasta_count from ch_identifyRefSequence_clusterAllGenomes.join(ch_callSequenceType_clusterAllGenomes.groupTuple(), by: 0).map{ tuple( it[0], it[1], it[4], it[4].size() ) }
+
+    output:
+    tuple ST, file("ST${ST}.mash_dist_from_ref.tab") into ch_clusterAllGenomes_filterAllGenomeClustering
+        
+    script:
+    """
+    mv fasta/${refname} .
+    
+    mash dist -p ${task.cpus} -s 5000 ${refname} fasta/* | sed 's/fasta\\///g' > ST${ST}.mash_dist_from_ref.tab
+    """
+}
+
+
+process FILTERALLGENOMECLUSTERING_PYTHON {
+    tag "ST${ST}"
+
+    input:
+    tuple ST, file(mash_dist_tab) from ch_clusterAllGenomes_filterAllGenomeClustering
+
+    output:
+    tuple ST, stdout into ch_clusterAllGenomes
+
+    script:
+    """
+    #!/usr/bin/env python3
+
+    import csv 
+    import statistics
+
+    distances = []
+
+    with open("${mash_dist_tab}") as tabfile:
+        lines = csv.reader(tabfile, delimiter = "	")
+        for line in lines:
+            distances.append(line)
+
+    sorted_distances = sorted(distances, key=lambda x: float(x[2]))
+
+    for line in sorted_distances[0:${maxstsize}]:
+        print("\\t".join(line))
+    """
+
+
+}
+
+/* Take maxstsize closest sequences to ref */
+
+ch_clusterAllGenomes.map{ tuple( it[0], tuple( it[1].split("\n") ) ) }
+                    .transpose()
+                    .map{ tuple( it[0], it[1].split("\t")[1] ) }
+                    .join(ch_callSequenceType_mapGenomes.map{ tuple( it[0], it[2], it[3] ) }, by: [0,1])
+                    .map{ tuple( it[0], it[2] ) }
+                    .set{ ch_clusterAllGenomes_mapGenomes }
+                    // [ ST, seqpath ]
 
 
 /* Use reference genome selection to link 
@@ -488,14 +558,13 @@ process MASHSKETCHREFS_MASH {
     """
 }
 
-
 process MAPGENOMES_SNIPPY {
     tag "ST${ST}-${query}"
 
     cpus 2
 
     input:
-    tuple ST, file(query), file("ref*.fa") from ch_callSequenceType_mapGenomes.map{ [ it[0], it[3] ] }.combine( ch_mapGenomes, by: 0)
+    tuple ST, file(query), file("ref*.fa") from ch_clusterAllGenomes_mapGenomes.combine( ch_mapGenomes, by: 0 )
 
     output:
     tuple ST, file("${query}_snippy") into ch_mapGenomes_makeAlignment
@@ -549,6 +618,8 @@ process CALCULATEPHYLOGENY_IQTREE {
 
 process DETECTRECOMBINATION_GUBBINS {
     tag "ST${ST}"
+
+    errorStrategy 'ignore'
 
     publishDir "${outputDir}/ST${ST}/gubbins_recombination_predictions", mode: 'copy', pattern: "ST${ST}.*"
 
@@ -646,6 +717,7 @@ process MASKREFERENCERECOMB_BEDTOOLS {
 }
 
 process CALCULATENOSIMREADS_PYTHON {
+    tag "ST${ST}-${fasta}"
 
     input:
     tuple ST, file(ref_fasta) from ch_calculateNoSimReads
